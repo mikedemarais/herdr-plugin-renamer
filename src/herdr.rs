@@ -7,6 +7,12 @@ use std::time::Duration;
 
 const METADATA_SOURCE: &str = "plugin:herdr-plugin-renamer";
 
+pub struct ActiveSession {
+    pub pane_id: String,
+    pub agent: String,
+    pub id: String,
+}
+
 fn herdr_bin() -> String {
     env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
@@ -36,6 +42,40 @@ fn pane_agent_session(pane_id: &str) -> Option<(String, String)> {
         })?;
     let id = session.get("value")?.as_str()?.to_owned();
     Some((agent, id))
+}
+
+/// Return active native agent sessions for startup metadata replay.
+pub fn active_sessions() -> Vec<ActiveSession> {
+    let output = match Command::new(herdr_bin()).args(["api", "snapshot"]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    value
+        .pointer("/result/snapshot/agents")
+        .and_then(|agents| agents.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let pane_id = entry.get("pane_id")?.as_str()?.to_owned();
+            let session = entry.get("agent_session")?;
+            let agent = session
+                .get("agent")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    session
+                        .get("source")
+                        .and_then(|value| value.as_str())
+                        .map(|source| source.trim_start_matches("herdr:"))
+                })?
+                .to_owned();
+            let id = session.get("value")?.as_str()?.to_owned();
+            Some(ActiveSession { pane_id, agent, id })
+        })
+        .collect()
 }
 
 pub fn poll_agent_session(

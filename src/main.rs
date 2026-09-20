@@ -22,10 +22,24 @@ const PROMPT_POLL_DELAY: Duration = Duration::from_millis(750);
 const MAX_DEBUG_LOG_BYTES: u64 = 256 * 1024;
 
 fn main() {
-    if env::var("HERDR_NAMING_PHASE").as_deref() == Ok("cold") {
+    if env::args().nth(1).as_deref() == Some("--replay") {
+        replay_cached_titles();
+    } else if env::var("HERDR_NAMING_PHASE").as_deref() == Ok("cold") {
         cold_phase();
     } else {
         hot_phase();
+    }
+}
+
+fn replay_cached_titles() {
+    let state_dir = state_dir();
+    for session in herdr::active_sessions() {
+        let key = marker_key_for_session(&session.agent, &session.id);
+        let title_cache = state_dir.join(format!("{key}.title"));
+        let legacy_cache = state_dir.join(format!("{key}.slug"));
+        if let Some(title) = read_cached_title(&title_cache, &legacy_cache) {
+            let _ = herdr::report_task(&session.pane_id, &title);
+        }
     }
 }
 

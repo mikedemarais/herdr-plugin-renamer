@@ -1,6 +1,6 @@
 [package]
 name = "herdr-plugin-renamer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Publishes human-readable coding-agent task titles in Herdr"
 authors = ["Wyatt Johnson <wyattjoh@gmail.com>", "Mike Demarais"]

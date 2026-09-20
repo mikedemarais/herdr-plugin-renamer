@@ -1,12 +1,15 @@
 id = "herdr-plugin-renamer"
 name = "Herdr Renamer"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.4"
 description = "Publishes a stable human-readable task title from an agent's first prompt."
 platforms = ["macos", "linux"]
 
 [[build]]
 command = ["cargo", "build", "--release"]
+
+[[startup]]
+command = ["target/release/herdr-plugin-renamer", "--replay"]
 
 [[events]]
 on = "pane.agent_status_changed"
