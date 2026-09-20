@@ -1,6 +1,4 @@
-//! The naming engine: a single headless Codex call that turns the captured
-//! prompt into a kebab-case slug. Bounded by a hard timeout; returns `None` on
-//! any failure so the caller can fall back to a deterministic local slug.
+//! A bounded headless Codex call that turns the first prompt into a concise title.
 
 use std::env;
 use std::path::Path;
@@ -10,45 +8,32 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_LIMIT: usize = 2000;
 
-/// Run `codex exec` non-interactively to produce a slug. The model's final
-/// message is written to `slug_file` via `-o`; we read and sanitize it.
-///
-/// `--ignore-user-config` is load-bearing: it disables the user's Codex hooks
-/// (SessionStart/UserPromptSubmit, including herdr's own), giving a
-/// deterministic, recursion-free run. Auth still resolves from CODEX_HOME.
-pub fn generate_slug(prompt: &str, slug_file: &Path) -> Option<String> {
+/// Run Codex without user config, hooks, writes, or session persistence.
+pub fn generate_title(prompt: &str, output_file: &Path) -> Option<String> {
     let bin = env::var("HERDR_NAMING_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
     let truncated: String = prompt.chars().take(PROMPT_LIMIT).collect();
     let full_prompt = format!(
-        "Output only a short kebab-case git branch slug (2-4 words, lowercase, \
-         hyphens only, no prose, no quotes, no surrounding text) summarizing \
-         this coding task:\n\n{truncated}"
+        "Output only a concise 3-6 word human-readable chat title in title case \
+         (spaces, not kebab-case), with no quotes, ending punctuation, or prose, \
+         summarizing this coding task:\n\n{truncated}"
     );
 
-    let _ = std::fs::remove_file(slug_file);
-
+    let _ = std::fs::remove_file(output_file);
     let mut child = Command::new(bin)
         .args([
             "exec",
             "--skip-git-repo-check",
             "--ignore-user-config",
-            // Don't persist a rollout session file for these throwaway naming runs.
             "--ephemeral",
             "-s",
             "read-only",
-            // gpt-5.5 + low is the fastest config available on ChatGPT-account auth:
-            // minimal effort is rejected (image_gen/web_search can't be disabled) and
-            // the faster spark/flash/mini models require API-key auth.
             "-m",
-            "gpt-5.5",
+            "gpt-5.6-luna",
             "-c",
             "model_reasoning_effort=low",
-            // Request the fast/priority service tier to shave queue latency.
-            "-c",
-            "service_tier=fast",
             "-o",
         ])
-        .arg(slug_file)
+        .arg(output_file)
         .arg(&full_prompt)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -62,28 +47,18 @@ pub fn generate_slug(prompt: &str, slug_file: &Path) -> Option<String> {
         return None;
     }
 
-    let raw = std::fs::read_to_string(slug_file).ok()?;
-    let slug = crate::slug::sanitize(&raw);
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
-    }
+    let raw = std::fs::read_to_string(output_file).ok()?;
+    let title = crate::slug::sanitize_title(&raw);
+    (!title.is_empty()).then_some(title)
 }
 
-/// Poll `try_wait` until the child exits or the timeout elapses. Returns true if
-/// the child finished on its own.
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if start.elapsed() >= timeout => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => return false,
         }
     }

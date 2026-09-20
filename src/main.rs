@@ -1,43 +1,25 @@
-//! herdr-plugin-renamer
-//!
-//! A herdr event hook (`pane.agent_status_changed`) that names a pane from the
-//! agent's first prompt, and also renames an auto-generated worktree
-//! branch/workspace when the pane is in a linked worktree.
-//!
-//! The binary runs in two phases:
-//!   - HOT  (default): fires on every event. Bails in microseconds from env
-//!     vars alone unless an agent just started working, then forks the cold
-//!     phase detached and exits.
-//!   - COLD (`HERDR_NAMING_PHASE=cold`): does the slow work (poll for the
-//!     session, read the first prompt, generate a slug via the engine chain,
-//!     rename the pane, and maybe rename branch + workspace).
-//!
-//! Every path exits 0 (fail open) so the hook never wedges herdr.
+//! Generate one stable, human-readable `$task` title from an agent's first prompt.
+//! The plugin never renames panes, agents, branches, workspaces, or tabs.
 
 mod codex;
 mod context;
-mod engine;
-#[cfg(target_os = "macos")]
-mod foundation;
-mod git;
 mod herdr;
 mod slug;
 mod transcript;
 
 use std::env;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A claim marker younger than this is treated as "cold phase in flight" so we
-/// don't launch a second Codex call for the same workspace. Older markers are
-/// considered stale (e.g. a crashed cold phase) and may be reclaimed.
 const CLAIM_TTL: Duration = Duration::from_secs(120);
 const SESSION_POLL_ATTEMPTS: u32 = 12;
 const SESSION_POLL_DELAY: Duration = Duration::from_millis(500);
 const PROMPT_POLL_ATTEMPTS: u32 = 20;
 const PROMPT_POLL_DELAY: Duration = Duration::from_millis(750);
+const MAX_DEBUG_LOG_BYTES: u64 = 256 * 1024;
 
 fn main() {
     if env::var("HERDR_NAMING_PHASE").as_deref() == Ok("cold") {
@@ -47,208 +29,104 @@ fn main() {
     }
 }
 
-/// Cheap gate on every event. Reads only env vars; no subprocess, no socket.
 fn hot_phase() {
     let event_json = match env::var("HERDR_PLUGIN_EVENT_JSON") {
         Ok(value) => value,
         Err(_) => return,
     };
-    let context_json = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-
-    let eligible = match context::evaluate(&event_json, &context_json) {
+    let eligible = match context::evaluate(&event_json) {
         Some(eligible) => eligible,
         None => return,
     };
-    let claim_key = marker_key_for_pane(&eligible.pane_id);
-
+    let marker_key = marker_key_for_pane(&eligible.pane_id);
     let state_dir = state_dir();
     migrate_legacy_marker_state(&state_dir);
-    let claim_marker = claim_marker_path(&state_dir, &claim_key);
-    if claim_is_fresh(&claim_marker) {
-        debug_log(&format!(
-            "hot: claim fresh, bail pane={} ws={}",
-            eligible.pane_id, eligible.workspace_id
-        ));
+    let claim = state_dir.join(format!("{marker_key}.claim"));
+    if claim_is_fresh(&claim) {
         return;
     }
-
     let _ = std::fs::create_dir_all(&state_dir);
-    let _ = std::fs::write(&claim_marker, now_secs().to_string());
-
-    debug_log(&format!(
-        "hot: eligible ws={} pane={} label={:?} linked={} -> fork cold",
-        eligible.workspace_id,
-        eligible.pane_id,
-        eligible.workspace_label,
-        eligible.is_linked_worktree
-    ));
-    spawn_cold_phase(&eligible, &claim_key);
+    let _ = std::fs::write(&claim, now_secs().to_string());
+    spawn_cold_phase(&eligible.pane_id, &marker_key);
 }
 
-/// The slow path, run detached so herdr is never blocked.
 fn cold_phase() {
     let pane_id = env::var("HN_PANE_ID").unwrap_or_default();
-    let workspace_id = env::var("HN_WORKSPACE_ID").unwrap_or_default();
-    let claim_key = env::var("HN_MARKER_KEY").unwrap_or_else(|_| marker_key_for_pane(&pane_id));
-    let checkout_path = env::var("HN_CHECKOUT_PATH")
-        .ok()
-        .filter(|path| !path.is_empty());
-    let is_linked_worktree = env::var("HN_IS_LINKED_WORKTREE").as_deref() == Ok("true");
+    let marker_key = env::var("HN_MARKER_KEY").unwrap_or_else(|_| marker_key_for_pane(&pane_id));
     let state_dir = state_dir();
-    let claim_marker = claim_marker_path(&state_dir, &claim_key);
-    debug_log(&format!("cold: start ws={workspace_id} pane={pane_id}"));
+    let claim = state_dir.join(format!("{marker_key}.claim"));
 
-    // Resolve the native session (with the timing-race poll), then use its
-    // stable identity for durable completion and slug state. Pane ids are
-    // compact display ids and can be reused by unrelated future sessions.
     let (agent, session_id) =
         match herdr::poll_agent_session(&pane_id, SESSION_POLL_ATTEMPTS, SESSION_POLL_DELAY) {
             Some(session) => session,
             None => {
-                debug_log("cold: no agent_session after poll, removing claim");
-                let _ = std::fs::remove_file(&claim_marker);
+                debug_log(&state_dir, "no agent session after polling");
+                let _ = std::fs::remove_file(&claim);
                 return;
             }
         };
     let session_key = marker_key_for_session(&agent, &session_id);
-    let done_marker = done_marker_path(&state_dir, &session_key);
-    if Path::new(&done_marker).exists() {
-        debug_log(&format!(
-            "cold: session done marker exists, removing claim pane={pane_id} agent={agent}"
-        ));
-        let _ = std::fs::remove_file(&claim_marker);
-        return;
-    }
-    debug_log(&format!("cold: session agent={agent} id={session_id}"));
+    let done = state_dir.join(format!("{session_key}.done"));
+    let title_cache = state_dir.join(format!("{session_key}.title"));
+    let legacy_cache = state_dir.join(format!("{session_key}.slug"));
 
-    // Poll for the first prompt, not just read once. Claude reports its session
-    // id at SessionStart (before the prompt is submitted) and flushes the user
-    // line a beat after the pane flips to `working`, so a single read can miss
-    // it. Since the agent then stays `working` with no new event to retry on, we
-    // must wait here rather than bail.
+    if done.exists() {
+        if let Some(title) = read_cached_title(&title_cache, &legacy_cache) {
+            let _ = herdr::report_task(&pane_id, &title);
+            let _ = std::fs::remove_file(&claim);
+            return;
+        }
+        // A completion marker without its cache cannot restore metadata.
+        let _ = std::fs::remove_file(&done);
+    }
+
     let prompt = match poll_first_prompt(&agent, &session_id) {
         Some(prompt) => prompt,
         None => {
-            debug_log("cold: no first prompt after poll, removing claim");
-            let _ = std::fs::remove_file(&claim_marker);
+            debug_log(&state_dir, "no first prompt after polling");
+            let _ = std::fs::remove_file(&claim);
             return;
         }
     };
-    debug_log(&format!(
-        "cold: first prompt ({} chars): {}",
-        prompt.chars().count(),
-        prompt.chars().take(80).collect::<String>()
-    ));
 
-    // Name it: walk the engine chain (on-device first by default, Codex
-    // fallback), then a deterministic local slug if every engine fails.
-    let slug_file = format!("{state_dir}/{session_key}.slug");
-    let slug = generate_slug(&prompt, Path::new(&slug_file)).unwrap_or_else(|| {
-        let slug = slug::fallback_from_prompt(&prompt);
-        debug_log(&format!("cold: all engines failed, fallback slug={slug}"));
-        slug
-    });
-
-    let ok = herdr::pane_rename(&pane_id, &slug);
-    debug_log(&format!("cold: pane {pane_id} -> {slug} ok={ok}"));
-
-    // Publish the same task name as display metadata so users can place `$task`
-    // in custom Agent and Space sidebar rows. Metadata failures do not affect
-    // the persistent pane, branch, or workspace renames.
-    let pane_metadata_ok = herdr::pane_report_task(&pane_id, &slug);
-    let workspace_metadata_ok = herdr::workspace_report_task(&workspace_id, &slug);
-    debug_log(&format!(
-        "cold: task metadata pane={pane_metadata_ok} workspace={workspace_metadata_ok}"
-    ));
-
-    // Safety re-check: only rename a branch still on the auto `worktree/` name.
-    // Only after a successful branch rename do we rename the workspace.
-    if is_linked_worktree {
-        if let Some(checkout_path) = checkout_path.as_deref() {
-            match git::current_branch(checkout_path) {
-                Some(current) if current.starts_with("worktree/") => {
-                    let branch = compose_branch(resolve_branch_prefix().as_deref(), &slug);
-                    let branch_ok = git::rename_current_branch(checkout_path, &branch);
-                    debug_log(&format!(
-                        "cold: branch {current} -> {branch} ok={branch_ok}"
-                    ));
-                    if branch_ok {
-                        let ok = herdr::workspace_rename(&workspace_id, &slug);
-                        debug_log(&format!(
-                            "cold: workspace rename ws={workspace_id} -> {slug} ok={ok}"
-                        ));
-                    } else {
-                        debug_log("cold: skip workspace rename, branch rename failed");
-                    }
-                }
-                other => debug_log(&format!(
-                    "cold: skip branch/workspace rename, current={other:?}"
-                )),
-            }
-        } else {
-            debug_log("cold: skip branch/workspace rename, checkout path unavailable");
+    let candidate = state_dir.join(format!("{session_key}.candidate"));
+    let generated = codex::generate_title(&prompt, &candidate);
+    let _ = std::fs::remove_file(&candidate);
+    let (title, generated_by_model) = match generated {
+        Some(title) => (title, true),
+        None => {
+            debug_log(
+                &state_dir,
+                "Codex naming failed; publishing retryable fallback",
+            );
+            (slug::fallback_title_from_prompt(&prompt), false)
         }
-    } else {
-        debug_log("cold: skip branch/workspace rename, not a linked worktree");
-    }
+    };
 
-    // Publish durable completion before releasing the transient claim so a
-    // status transition cannot open a duplicate-run window between the two.
-    let _ = std::fs::write(&done_marker, now_secs().to_string());
-    let _ = std::fs::remove_file(&claim_marker);
+    let _ = std::fs::create_dir_all(&state_dir);
+    let _ = std::fs::write(&title_cache, format!("{title}\n"));
+    let _ = herdr::report_task(&pane_id, &title);
+    if generated_by_model {
+        let _ = std::fs::write(&done, now_secs().to_string());
+    }
+    let _ = std::fs::remove_file(&claim);
 }
 
-/// Walk the engine chain selected by `HERDR_NAMING_ENGINE`, returning the first
-/// slug an engine produces. `None` means every engine in the chain failed (so
-/// the caller uses the deterministic local fallback).
-fn generate_slug(prompt: &str, slug_file: &Path) -> Option<String> {
-    let selection = env::var("HERDR_NAMING_ENGINE").ok();
-    for eng in engine::engine_chain(selection.as_deref()) {
-        let result = match eng {
-            #[cfg(target_os = "macos")]
-            engine::Engine::Foundation => foundation::generate_slug(prompt),
-            engine::Engine::Codex => codex::generate_slug(prompt, slug_file),
-        };
-        match result {
-            Some(slug) => {
-                debug_log(&format!("cold: {eng:?} slug={slug}"));
-                return Some(slug);
-            }
-            None => debug_log(&format!("cold: {eng:?} produced no slug")),
-        }
+fn read_cached_title(title_cache: &Path, legacy_cache: &Path) -> Option<String> {
+    let (raw, migrated) = match std::fs::read_to_string(title_cache) {
+        Ok(raw) => (raw, false),
+        Err(_) => (std::fs::read_to_string(legacy_cache).ok()?, true),
+    };
+    let title = slug::sanitize_title(&raw);
+    if title.is_empty() {
+        return None;
     }
-    None
+    if migrated {
+        let _ = std::fs::write(title_cache, format!("{title}\n"));
+    }
+    Some(title)
 }
 
-/// Join an optional branch prefix and the slug into the final branch name.
-/// Trailing/leading slashes and surrounding whitespace on the prefix are
-/// trimmed; an empty or whitespace-only prefix yields the bare slug.
-fn compose_branch(prefix: Option<&str>, slug: &str) -> String {
-    match prefix
-        .map(|p| p.trim().trim_matches('/'))
-        .filter(|p| !p.is_empty())
-    {
-        Some(prefix) => format!("{prefix}/{slug}"),
-        None => slug.to_string(),
-    }
-}
-
-/// Resolve the branch prefix, in priority order: the `HERDR_NAMING_BRANCH_PREFIX`
-/// env var (override, incl. set-empty to force no prefix), then a `branch-prefix`
-/// file in the per-plugin config dir (`HERDR_PLUGIN_CONFIG_DIR`), else `None` for
-/// no prefix. The config file is the install-friendly path: it does not depend on
-/// the environment herdr was launched with.
-fn resolve_branch_prefix() -> Option<String> {
-    if let Ok(prefix) = env::var("HERDR_NAMING_BRANCH_PREFIX") {
-        return Some(prefix);
-    }
-    let dir = env::var("HERDR_PLUGIN_CONFIG_DIR").ok()?;
-    std::fs::read_to_string(format!("{dir}/branch-prefix")).ok()
-}
-
-/// Retry `read_first_prompt` until the transcript has the user's first message
-/// or we exhaust the attempts. Covers the lag between the pane reporting
-/// `working` and the agent flushing the first user line to its transcript.
 fn poll_first_prompt(agent: &str, session_id: &str) -> Option<String> {
     for attempt in 0..PROMPT_POLL_ATTEMPTS {
         if let Some(prompt) = transcript::read_first_prompt(agent, session_id) {
@@ -261,50 +139,33 @@ fn poll_first_prompt(agent: &str, session_id: &str) -> Option<String> {
     None
 }
 
-/// Re-exec ourselves in the cold phase, detached into a new session so it
-/// survives the hot process exiting and any herdr process-group cleanup.
-fn spawn_cold_phase(eligible: &context::Eligible, marker_key: &str) {
+fn spawn_cold_phase(pane_id: &str, marker_key: &str) {
     let exe = match env::current_exe() {
         Ok(exe) => exe,
         Err(_) => return,
     };
-
     let mut command = Command::new(exe);
     command
         .env("HERDR_NAMING_PHASE", "cold")
-        .env("HN_PANE_ID", &eligible.pane_id)
-        .env("HN_WORKSPACE_ID", &eligible.workspace_id)
-        .env(
-            "HN_WORKSPACE_LABEL",
-            eligible.workspace_label.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HN_CHECKOUT_PATH",
-            eligible.checkout_path.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HN_IS_LINKED_WORKTREE",
-            eligible.is_linked_worktree.to_string(),
-        )
+        .env("HN_PANE_ID", pane_id)
         .env("HN_MARKER_KEY", marker_key)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-
-    // SAFETY: setsid only detaches the child into a new session; it does not
-    // touch this process's memory and is async-signal-safe.
+    // SAFETY: setsid only detaches the child into a new process session.
     unsafe {
         command.pre_exec(|| {
             libc::setsid();
             Ok(())
         });
     }
-
     let _ = command.spawn();
 }
 
-fn state_dir() -> String {
-    env::var("HERDR_PLUGIN_STATE_DIR").unwrap_or_else(|_| "/tmp".to_string())
+fn state_dir() -> PathBuf {
+    env::var("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/herdr-plugin-renamer"))
 }
 
 fn marker_key_for_pane(pane_id: &str) -> String {
@@ -321,13 +182,7 @@ fn marker_key_for_pane(pane_id: &str) -> String {
     format!("claim-pane-{safe}")
 }
 
-/// Stable, path-safe identity for one native agent session. Herdr pane ids are
-/// compact display ids and can be reused, while the native session reference is
-/// unique for each Claude, Codex, or Pi run.
 fn marker_key_for_session(agent: &str, session_id: &str) -> String {
-    // FNV-1a keeps long Pi transcript paths and opaque session ids out of file
-    // names without adding a hashing dependency. The marker is only a local
-    // idempotency key; a collision would cause a harmless skipped rename.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in agent
         .bytes()
@@ -350,23 +205,19 @@ fn marker_key_for_session(agent: &str, session_id: &str) -> String {
     format!("session-{safe_agent}-{hash:016x}")
 }
 
-/// Remove pane-id keyed state from releases before session-scoped markers.
-/// Herdr reuses compact pane ids, so legacy `.done` files can suppress an
-/// unrelated future agent session. A sentinel keeps this scan one-time.
-fn migrate_legacy_marker_state(state_dir: &str) {
-    let sentinel = Path::new(state_dir).join("state-v2.migrated");
+fn migrate_legacy_marker_state(state_dir: &Path) {
+    let sentinel = state_dir.join("state-v2.migrated");
     if sentinel.exists() {
         return;
     }
-
     let _ = std::fs::create_dir_all(state_dir);
     if let Ok(entries) = std::fs::read_dir(state_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_legacy_marker = name.starts_with("pane-")
-                && (name.ends_with(".claim") || name.ends_with(".done") || name.ends_with(".slug"));
-            if is_legacy_marker {
+            if name.starts_with("pane-")
+                && (name.ends_with(".claim") || name.ends_with(".done") || name.ends_with(".slug"))
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -374,141 +225,77 @@ fn migrate_legacy_marker_state(state_dir: &str) {
     let _ = std::fs::write(sentinel, "2");
 }
 
-fn claim_marker_path(state_dir: &str, marker_key: &str) -> String {
-    format!("{state_dir}/{marker_key}.claim")
-}
-
-fn done_marker_path(state_dir: &str, marker_key: &str) -> String {
-    format!("{state_dir}/{marker_key}.done")
-}
-
-/// True when a claim marker exists and is younger than `CLAIM_TTL`.
-fn claim_is_fresh(marker: &str) -> bool {
-    let metadata = match std::fs::metadata(marker) {
-        Ok(metadata) => metadata,
-        Err(_) => return false,
-    };
-    let modified = match metadata.modified() {
-        Ok(modified) => modified,
-        Err(_) => return true,
-    };
-    match modified.elapsed() {
-        Ok(age) => age < CLAIM_TTL,
-        // Can't read the age: assume fresh and bail rather than double-fire.
-        Err(_) => true,
-    }
+fn claim_is_fresh(marker: &Path) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .map(|age| age < CLAIM_TTL)
+        .unwrap_or(false)
 }
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
 
-/// Append a diagnostic line to `<state_dir>/debug.log`. Only called on the rare
-/// eligible/cold paths, so it never costs the hot-path bail anything. The cold
-/// phase runs detached with stderr to /dev/null, so a file is the only way to
-/// see what it did.
-fn debug_log(message: &str) {
-    let dir = state_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    use std::io::Write;
+fn debug_log(state_dir: &Path, message: &str) {
+    if env::var("HERDR_NAMING_DEBUG").as_deref() != Ok("true") {
+        return;
+    }
+    let _ = std::fs::create_dir_all(state_dir);
+    let path = state_dir.join("debug.log");
+    if std::fs::metadata(&path)
+        .map(|metadata| metadata.len() >= MAX_DEBUG_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::write(&path, "");
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(format!("{dir}/debug.log"))
+        .open(path)
     {
         let _ = writeln!(
             file,
-            "{} [pid {}] {}",
+            "{} [pid {}] {message}",
             now_secs(),
-            std::process::id(),
-            message
+            std::process::id()
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compose_branch, marker_key_for_pane, marker_key_for_session, migrate_legacy_marker_state,
-    };
+    use super::*;
 
     #[test]
-    fn no_prefix_is_bare_slug() {
-        assert_eq!(compose_branch(None, "add-dark-mode"), "add-dark-mode");
-        assert_eq!(compose_branch(Some(""), "add-dark-mode"), "add-dark-mode");
-        assert_eq!(
-            compose_branch(Some("   "), "add-dark-mode"),
-            "add-dark-mode"
-        );
-    }
-
-    #[test]
-    fn prefix_is_joined_with_a_slash() {
-        assert_eq!(
-            compose_branch(Some("wyattjoh"), "add-dark-mode"),
-            "wyattjoh/add-dark-mode"
-        );
-    }
-
-    #[test]
-    fn surrounding_slashes_and_whitespace_are_trimmed() {
-        assert_eq!(
-            compose_branch(Some("  /wyattjoh/  "), "add-dark-mode"),
-            "wyattjoh/add-dark-mode"
-        );
-    }
-
-    #[test]
-    fn internal_slashes_in_prefix_are_kept() {
-        assert_eq!(
-            compose_branch(Some("team/wyatt"), "add-dark-mode"),
-            "team/wyatt/add-dark-mode"
-        );
-    }
-
-    #[test]
-    fn marker_key_is_safe_for_pane_ids() {
+    fn marker_keys_are_stable_and_distinct() {
         assert_eq!(marker_key_for_pane("w5V:p1"), "claim-pane-w5V_p1");
+        assert_eq!(
+            marker_key_for_session("pi", "/tmp/first"),
+            marker_key_for_session("pi", "/tmp/first")
+        );
+        assert_ne!(
+            marker_key_for_session("pi", "/tmp/first"),
+            marker_key_for_session("pi", "/tmp/second")
+        );
     }
 
     #[test]
-    fn marker_key_tracks_agent_session_instead_of_reused_pane() {
-        let first = marker_key_for_session("pi", "/tmp/session-first.jsonl");
-        let repeated = marker_key_for_session("pi", "/tmp/session-first.jsonl");
-        let replacement = marker_key_for_session("pi", "/tmp/session-second.jsonl");
-
-        assert_eq!(first, repeated);
-        assert_ne!(first, replacement);
-        assert!(first.starts_with("session-pi-"));
-    }
-
-    #[test]
-    fn legacy_pane_markers_are_removed_once_without_touching_session_markers() {
-        let dir = std::env::temp_dir().join(format!(
-            "herdr-renamer-migration-test-{}",
-            std::process::id()
-        ));
+    fn cached_legacy_title_is_migrated() {
+        let dir = std::env::temp_dir().join(format!("herdr-title-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("pane-w15_p4.done"), "old").unwrap();
-        std::fs::write(dir.join("pane-w15_p4.claim"), "old").unwrap();
-        std::fs::write(dir.join("pane-w15_p4.slug"), "old-task").unwrap();
-        std::fs::write(dir.join("session-pi-abc.done"), "current").unwrap();
-
-        migrate_legacy_marker_state(dir.to_str().unwrap());
-
-        assert!(!dir.join("pane-w15_p4.done").exists());
-        assert!(!dir.join("pane-w15_p4.claim").exists());
-        assert!(!dir.join("pane-w15_p4.slug").exists());
-        assert!(dir.join("session-pi-abc.done").exists());
-        assert!(dir.join("state-v2.migrated").exists());
-
-        std::fs::write(dir.join("pane-current.claim"), "active").unwrap();
-        migrate_legacy_marker_state(dir.to_str().unwrap());
-        assert!(dir.join("pane-current.claim").exists());
+        let title = dir.join("session.title");
+        let legacy = dir.join("session.slug");
+        std::fs::write(&legacy, "Review Hermes Routing\n").unwrap();
+        assert_eq!(
+            read_cached_title(&title, &legacy).as_deref(),
+            Some("Review Hermes Routing")
+        );
+        assert!(title.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

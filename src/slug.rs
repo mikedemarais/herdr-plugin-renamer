@@ -1,56 +1,46 @@
-//! Turning arbitrary text into a safe kebab-case slug, and a deterministic
-//! fallback slug derived from the prompt when the Codex naming engine is
-//! unavailable.
+//! Human-readable task-title cleanup and deterministic fallback generation.
 
 const MAX_WORDS: usize = 6;
-const MAX_LEN: usize = 50;
+const MAX_LEN: usize = 60;
 
-/// Lowercase, collapse every run of non-alphanumeric characters into a single
-/// hyphen, trim leading/trailing hyphens, then cap to `MAX_WORDS` words and
-/// `MAX_LEN` characters. ASCII-only output suitable for a git branch name.
-pub fn sanitize(raw: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = true; // start true so leading separators are dropped
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-
-    let capped = out
-        .split('-')
-        .filter(|w| !w.is_empty())
+/// Preserve spaces and capitalization while removing surrounding punctuation,
+/// excess words, control characters, and excess length.
+pub fn sanitize_title(raw: &str) -> String {
+    let words = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
         .take(MAX_WORDS)
-        .collect::<Vec<_>>()
-        .join("-");
-
-    let mut capped = if capped.len() > MAX_LEN {
-        capped[..MAX_LEN].to_string()
+        .collect::<Vec<_>>();
+    let title = words.join(" ");
+    if title.chars().count() <= MAX_LEN {
+        title
     } else {
-        capped
-    };
-    while capped.ends_with('-') {
-        capped.pop();
+        format!(
+            "{}…",
+            title
+                .chars()
+                .take(MAX_LEN - 1)
+                .collect::<String>()
+                .trim_end()
+        )
     }
-    capped
 }
 
-/// Build a slug from the first non-empty line of the prompt. Never returns an
-/// empty string, so a rename always has something to use.
-pub fn fallback_from_prompt(prompt: &str) -> String {
-    let first_line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let slug = sanitize(first_line);
-    if slug.is_empty() {
-        "agent-task".to_string()
+/// Derive a readable emergency fallback from the first prompt line.
+pub fn fallback_title_from_prompt(prompt: &str) -> String {
+    let first_line = prompt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let title = sanitize_title(first_line);
+    if title.is_empty() {
+        "Agent task".to_string()
     } else {
-        slug
+        title
     }
 }
 
@@ -59,50 +49,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_kebab() {
-        assert_eq!(sanitize("OAuth Login Providers"), "oauth-login-providers");
-    }
-
-    #[test]
-    fn collapses_punctuation_and_spaces() {
+    fn preserves_human_title_spaces() {
         assert_eq!(
-            sanitize("Fix the bug!!! in   parser"),
-            "fix-the-bug-in-parser"
+            sanitize_title("Review Hermes Routing Research."),
+            "Review Hermes Routing Research"
         );
     }
 
     #[test]
-    fn trims_edges() {
-        assert_eq!(sanitize("  --Hello, World--  "), "hello-world");
-    }
-
-    #[test]
-    fn caps_to_six_words() {
+    fn caps_words_and_length() {
         assert_eq!(
-            sanitize("one two three four five six seven eight"),
-            "one-two-three-four-five-six"
+            sanitize_title("one two three four five six seven"),
+            "one two three four five six"
         );
-    }
-
-    #[test]
-    fn empty_input_is_empty() {
-        assert_eq!(sanitize("   !!!   "), "");
+        assert!(sanitize_title(&"a".repeat(80)).ends_with('…'));
     }
 
     #[test]
     fn fallback_never_empty() {
-        assert_eq!(fallback_from_prompt("!!!"), "agent-task");
-        assert_eq!(
-            fallback_from_prompt("Add JWT auth to the API endpoints please"),
-            "add-jwt-auth-to-the-api"
-        );
-    }
-
-    #[test]
-    fn fallback_uses_first_nonempty_line() {
-        assert_eq!(
-            fallback_from_prompt("\n\n  \nRefactor token validation"),
-            "refactor-token-validation"
-        );
+        assert_eq!(fallback_title_from_prompt("!!!"), "Agent task");
     }
 }

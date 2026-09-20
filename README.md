@@ -1,107 +1,52 @@
 # herdr-plugin-renamer
 
-A [herdr](https://herdr.dev) plugin that names panes from a coding agent's first
-prompt. In auto-generated linked worktrees, it also renames the git branch and
-workspace.
+A narrow [Herdr](https://herdr.dev) plugin that publishes a stable, human-readable
+`$task` title for Claude Code, Codex, and Pi sessions.
 
-It supports Claude Code, Codex, and Pi. Slugs come from Apple FoundationModels on
-supported Macs, then Codex, then a deterministic local fallback.
+For each native agent session it reads the first prompt, asks the authenticated
+Codex CLI (`gpt-5.6-luna`, low reasoning) for a concise 3–6 word title, and
+reports only the `task` metadata token. It does **not** rename panes, displayed
+agents, tabs, workspaces, or Git branches.
 
 ## Install
 
 ```sh
-herdr plugin install wyattjoh/herdr-plugin-renamer
-```
-
-GitHub installs run the manifest's Rust and platform-specific build steps before
-registering the plugin. On macOS, the optional FoundationModels helper is built
-only when the active Swift toolchain supports its guided-generation macros;
-otherwise installation continues with the Codex/local fallbacks. Local
-`herdr plugin link` intentionally does not build; use `just link` from a
-development checkout instead.
-
-Install the herdr integration for each agent you use:
-
-```sh
+herdr plugin install mikedemarais/herdr-plugin-renamer --yes
 herdr integration install claude
 herdr integration install codex
 herdr integration install pi
 ```
 
-## Requirements
-
-- herdr 0.7.4+ on macOS or Linux
-- For on-device naming: macOS 26+ on Apple Silicon, Apple Intelligence enabled,
-  and a Swift toolchain with FoundationModels guided-generation macro support.
-  Current Command Line Tools omit that macro plugin, so installation skips the
-  optional helper.
-- For Codex naming: the `codex` CLI on `PATH` and logged in
-
-Without either naming model, the plugin derives a rough local slug from the
-prompt.
-
-## What it renames
-
-A prompt about reviewing a cache might rename the pane to `cache-review`. In an
-auto-generated linked worktree, the plugin can also rename:
-
-- branch: `<prefix>/cache-review`, or `cache-review` without a prefix
-- workspace: `cache-review`
-
-Branch and workspace renaming only happens when the current branch starts with
-`worktree/`. The branch rename is local and never pushes to the remote.
-
-Each native agent session is named once, even when its status changes repeatedly.
-Session identity—not Herdr's reusable compact pane id—owns the completion and
-cached-slug state.
-
-The generated name is also published as pane/workspace metadata:
-
-- pane: `--title`, `--display-agent`, and `$task` token
-- workspace: `$task` token
-
-That means the Herdr sidebar and outer title plugins can show the task without
-scraping session files. For custom Agent and Space sidebar rows:
+Configure the Agents sidebar:
 
 ```toml
 [ui.sidebar.agents]
-rows = [["state_icon", "agent"], ["$task"]]
-
-[ui.sidebar.spaces]
-rows = [["workspace"], ["$task"]]
+rows = [
+  ["state_icon", "$task"],
+  ["agent", "workspace"],
+]
 ```
 
-## Configuration
+Requirements: Herdr 0.7.4+, Rust at install time, and an authenticated `codex`
+CLI on `PATH` with access to `gpt-5.6-luna`.
 
-All settings are optional.
+## Behavior
 
-| Setting                       | Default        | Purpose                                      |
-| ----------------------------- | -------------- | -------------------------------------------- |
-| `HERDR_NAMING_ENGINE`         | `foundation`   | Use Foundation with Codex fallback, or `codex` only |
-| `HERDR_NAMING_BRANCH_PREFIX`  | none           | Prefix renamed branches, such as `wyattjoh`  |
-| `HERDR_NAMING_FOUNDATION_BIN` | bundled helper | Override the FoundationModels helper path    |
-| `HERDR_NAMING_CODEX_BIN`      | `codex`        | Override the Codex executable path           |
+- Titles are generated once from the first prompt and cached per native session.
+- Cached titles are re-reported after Herdr restarts.
+- A failed Codex call publishes a readable local fallback but does not mark the
+  session complete, so a later `working` transition retries Codex.
+- Codex runs with `--ignore-user-config`, `--ephemeral`, and a read-only sandbox.
+- Debug logging is off by default. Set `HERDR_NAMING_DEBUG=true` to enable a
+  bounded 256 KiB diagnostic log without prompt excerpts.
+- Legacy `.slug` caches are read and migrated to `.title` files.
 
-To configure a persistent branch prefix:
+## Development
 
 ```sh
-echo wyattjoh > "$(herdr plugin config-dir herdr-plugin-renamer)/branch-prefix"
+cargo fmt --check
+cargo test
+cargo build --release
 ```
 
-`HERDR_NAMING_BRANCH_PREFIX` takes precedence over that file. Environment
-variables must be available wherever herdr is launched.
-
-## Local development
-
-```sh
-just build
-just link
-```
-
-`herdr plugin link` does not run build steps, so use `just link` or build first.
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development and test
-workflow.
-
-## License
-
-[MIT](LICENSE)
+License: MIT.

@@ -1,5 +1,4 @@
-//! Calls back into herdr over its CLI: reading a pane's native agent session
-//! (with a short poll for the documented timing race) and renaming Herdr labels.
+//! Minimal callbacks into Herdr: resolve a pane's native session and publish `$task`.
 
 use std::env;
 use std::process::Command;
@@ -12,9 +11,6 @@ fn herdr_bin() -> String {
     env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
-/// `herdr pane get <pane_id>` returns JSON by default. Extract the agent label
-/// and session reference (an id or Pi-reported path) from `agent_session`.
-/// Returns `None` when the session has not been reported yet.
 fn pane_agent_session(pane_id: &str) -> Option<(String, String)> {
     let output = Command::new(herdr_bin())
         .args(["pane", "get", pane_id])
@@ -24,28 +20,24 @@ fn pane_agent_session(pane_id: &str) -> Option<(String, String)> {
         return None;
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    // The CLI wraps the pane in a `{"result":{"pane":{...}}}` envelope. Accept
-    // the wrapped shape first, then fall back to unwrapped variants.
     let session = value
         .pointer("/result/pane/agent_session")
         .or_else(|| value.pointer("/pane/agent_session"))
         .or_else(|| value.get("agent_session"))?;
-
-    let agent = match session.get("agent").and_then(|a| a.as_str()) {
-        Some(a) => a.to_string(),
-        // Older builds emit only `source` (e.g. "herdr:claude").
-        None => session
-            .get("source")
-            .and_then(|s| s.as_str())
-            .map(|s| s.trim_start_matches("herdr:").to_string())?,
-    };
-    let value = session.get("value").and_then(|v| v.as_str())?.to_string();
-    Some((agent, value))
+    let agent = session
+        .get("agent")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            session
+                .get("source")
+                .and_then(|value| value.as_str())
+                .map(|source| source.trim_start_matches("herdr:").to_owned())
+        })?;
+    let id = session.get("value")?.as_str()?.to_owned();
+    Some((agent, id))
 }
 
-/// Poll `pane get` for the session reference. `pane.agent_status_changed` can fire
-/// before herdr has received the session from the integration hook, so we retry
-/// briefly before giving up.
 pub fn poll_agent_session(
     pane_id: &str,
     attempts: u32,
@@ -62,61 +54,19 @@ pub fn poll_agent_session(
     None
 }
 
-/// `herdr workspace rename <workspace_id> <label>`.
-pub fn workspace_rename(workspace_id: &str, label: &str) -> bool {
+/// Publish only the custom `$task` token. Pane titles and agent labels stay untouched.
+pub fn report_task(pane_id: &str, task: &str) -> bool {
     Command::new(herdr_bin())
-        .args(["workspace", "rename", workspace_id, label])
+        .args([
+            "pane",
+            "report-metadata",
+            pane_id,
+            "--source",
+            METADATA_SOURCE,
+            "--token",
+            &format!("task={task}"),
+        ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// `herdr pane rename <pane_id> <label>`.
-pub fn pane_rename(pane_id: &str, label: &str) -> bool {
-    Command::new(herdr_bin())
-        .args(["pane", "rename", pane_id, label])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Publish the generated task name for custom Agent sidebar rows via `$task`,
-/// and also set pane title / display-agent so the Herdr UI and outer title
-/// plugins can show the task without scraping session files.
-pub fn pane_report_task(pane_id: &str, task: &str) -> bool {
-    report_task_metadata("pane", pane_id, task, true)
-}
-
-/// Publish the generated task name for custom Space sidebar rows via `$task`.
-pub fn workspace_report_task(workspace_id: &str, task: &str) -> bool {
-    report_task_metadata("workspace", workspace_id, task, false)
-}
-
-fn report_task_metadata(resource: &str, resource_id: &str, task: &str, with_title: bool) -> bool {
-    let token = format!("task={task}");
-    let mut args = vec![
-        resource.to_string(),
-        "report-metadata".to_string(),
-        resource_id.to_string(),
-        "--source".to_string(),
-        METADATA_SOURCE.to_string(),
-        "--token".to_string(),
-        token,
-    ];
-    // Pane metadata can carry a human title + display-agent. Workspace
-    // metadata only supports tokens for custom Space rows.
-    if with_title {
-        args.push("--title".to_string());
-        args.push(task.to_string());
-        args.push("--display-agent".to_string());
-        args.push(task.to_string());
-        // Keep the title sticky for the session; cold phase refreshes it.
-        args.push("--ttl-ms".to_string());
-        args.push("86400000".to_string());
-    }
-    Command::new(herdr_bin())
-        .args(&args)
-        .status()
-        .map(|s| s.success())
+        .map(|status| status.success())
         .unwrap_or(false)
 }

@@ -1,14 +1,14 @@
 [package]
 name = "herdr-plugin-renamer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Names herdr panes, and auto-generated worktree branches/workspaces, from the agent's first prompt."
-authors = ["Wyatt Johnson <wyattjoh@gmail.com>"]
+description = "Publishes human-readable coding-agent task titles in Herdr"
+authors = ["Wyatt Johnson <wyattjoh@gmail.com>", "Mike Demarais"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/wyattjoh/herdr-plugin-renamer"
-homepage = "https://github.com/wyattjoh/herdr-plugin-renamer"
-keywords = ["herdr", "plugin", "worktree", "git", "agent"]
+repository = "https://github.com/mikedemarais/herdr-plugin-renamer"
+homepage = "https://github.com/mikedemarais/herdr-plugin-renamer"
+keywords = ["herdr", "plugin", "agent", "title"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
